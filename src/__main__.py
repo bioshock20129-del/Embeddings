@@ -15,8 +15,20 @@ from src.utils import save_to_file, make_pipeline, NumpyArrayEncoder, filter_by_
 # загружаем переменные окружения из .env
 load_dotenv(find_dotenv())
 
+# Settings for history of llm chat
+SIZE_FOR_GENERATE = 100
 TEST_HISTORY_FROM_FILE = False
 TRAIN_HISTORY_FROM_FILE = True
+
+# Settings for TF-IDT
+NGRAM_RANGE = (1, 2)
+STOP_WORDS = ["russian"]
+MAX_FEATURES = 5000
+LOWERCASE = True
+
+# Settings for SVD
+N_COMPONENTS = 100
+RANDOM_STATE = 42
 
 
 def make_history():
@@ -25,14 +37,14 @@ def make_history():
 
     path_to_train = "train_history.json"
     if not TRAIN_HISTORY_FROM_FILE:
-        train_history = generate_from_llm(analytic, finance, start_message, 10)
+        train_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE)
         train_history.save_to_file(path_to_train)
     else:
         train_history = read_from_file(path_to_train)
 
     path_to_test = "test_history_v2.json"
     if not TEST_HISTORY_FROM_FILE:
-        test_history = generate_from_llm(analytic, finance, start_message, 100)
+        test_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE)
         test_history.save_to_file(path_to_test)
     else:
         test_history = read_from_file(path_to_test)
@@ -43,8 +55,9 @@ def make_history():
 def make_predict():
     pipeline_by_get_model = make_pipeline(
         lambda data_author: {
-            "tf_idf": TfidfVectorizer(lowercase=True, stop_words=['russian'], ngram_range=(1, 2), max_features=5000),
-            "svd": TruncatedSVD(n_components=100, random_state=42),
+            "tf_idf": TfidfVectorizer(lowercase=LOWERCASE, stop_words=STOP_WORDS, ngram_range=NGRAM_RANGE,
+                                      max_features=MAX_FEATURES),
+            "svd": TruncatedSVD(n_components=N_COMPONENTS, random_state=RANDOM_STATE),
             "data": data_author["messages"],
             "scores": data_author["scores"]
         },
@@ -122,11 +135,6 @@ if __name__ == "__main__":
     model = GigaChat(
         credentials=os.getenv("GIGACHAT_API_TOKEN"),
         model=os.getenv("GIGACHAT_MODEL"),
-        scope=os.getenv("GIGACHAT_SCOPE"),
-        verify_ssl_certs=False
-    )
-    embedding = GigaChatEmbeddings(
-        credentials=os.getenv("GIGACHAT_API_TOKEN"),
         scope=os.getenv("GIGACHAT_SCOPE"),
         verify_ssl_certs=False
     )
