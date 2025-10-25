@@ -2,7 +2,7 @@ import json
 import os
 
 from dotenv import load_dotenv, find_dotenv
-from langchain_gigachat import GigaChat, GigaChatEmbeddings
+from langchain_gigachat import GigaChat
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LinearRegression
