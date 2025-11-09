@@ -205,3 +205,6 @@ predict_analytic = model_analytic(test_history)
 * **JSON** — для сохранения результатов
 
 ---
+
+# Требования
+* Python 3.13
