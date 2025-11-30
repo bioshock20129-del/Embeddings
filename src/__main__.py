@@ -1,23 +1,27 @@
 import json
 import os
 
+import numpy as np
 from dotenv import load_dotenv, find_dotenv
-from langchain_gigachat import GigaChat
+from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import normalize
 
-from src.dialogue.history import generate_from_llm, read_from_file
+from src.dialogue.history import generate_from_llm, read_from_file, HistoryDialogue
 from src.llm.agent import Agent
 from src.llm.prompts import prompts_analytic, prompt_finance
-from src.utils import save_to_file, make_pipeline, NumpyArrayEncoder, filter_by_author
+from src.utils import save_to_file, make_pipeline, NumpyArrayEncoder, filter_by_author, embedding_metrics
 
 # загружаем переменные окружения из .env
 load_dotenv(find_dotenv())
 
+PATH_TO_DATA = os.path.join(os.getcwd(), "data")
+
 # Settings for history of llm chat
-SIZE_FOR_GENERATE = 100
-TEST_HISTORY_FROM_FILE = False
+SIZE_FOR_GENERATE = 101
+TEST_HISTORY_FROM_FILE = True
 TRAIN_HISTORY_FROM_FILE = True
 
 # Settings for TF-IDT
@@ -31,20 +35,20 @@ N_COMPONENTS = 100
 RANDOM_STATE = 42
 
 
-def make_history():
+def make_history(score_fn):
     start_message = """Если смотреть на кризис 2008 года системно, то ключевым триггером стала переоценка рисков на рынке ипотечных деривативов. 
     Банки массово упаковывали плохие кредиты в сложные финансовые инструменты, теряя понимание их реальной стоимости…"""
 
-    path_to_train = "train_history.json"
+    path_to_train = os.path.join(PATH_TO_DATA, "train_history_100.json")
     if not TRAIN_HISTORY_FROM_FILE:
-        train_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE)
+        train_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE, score_fn)
         train_history.save_to_file(path_to_train)
     else:
         train_history = read_from_file(path_to_train)
 
-    path_to_test = "test_history_v2.json"
+    path_to_test = os.path.join(PATH_TO_DATA, "test_history_100.json")
     if not TEST_HISTORY_FROM_FILE:
-        test_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE)
+        test_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE, score_fn)
         test_history.save_to_file(path_to_test)
     else:
         test_history = read_from_file(path_to_test)
@@ -52,18 +56,25 @@ def make_history():
     return train_history, test_history
 
 
-def make_predict():
+def make_predict(train_data: HistoryDialogue, prompts):
+    global_tf_idf = TfidfVectorizer(lowercase=LOWERCASE,
+                                    stop_words=STOP_WORDS,
+                                    ngram_range=NGRAM_RANGE,
+                                    max_features=MAX_FEATURES)
+    global_tf_idf.fit(
+        list(map(lambda x: x["message"], train_data.messages)) + prompts
+    )
+
     pipeline_by_get_model = make_pipeline(
         lambda data_author: {
-            "tf_idf": TfidfVectorizer(lowercase=LOWERCASE, stop_words=STOP_WORDS, ngram_range=NGRAM_RANGE,
-                                      max_features=MAX_FEATURES),
+            "tf_idf": global_tf_idf,
             "svd": TruncatedSVD(n_components=N_COMPONENTS, random_state=RANDOM_STATE),
             "data": data_author["messages"],
             "scores": data_author["scores"]
         },
         lambda state: {
             **state,
-            "matrix": state["svd"].fit_transform(state["tf_idf"].fit_transform(state["data"]))
+            "matrix": state["svd"].fit_transform(state["tf_idf"].transform(state["data"]))
         },
         lambda state: {
             **state,
@@ -86,11 +97,15 @@ def make_predict():
         }
     )
 
-    def lambda_predict(train_data, name):
+    def lambda_predict(name):
         # Получаем сообщения и оценки
+        scores = filter_by_author("score", name, train_data.messages)
+        s_min, s_max = np.min(scores), np.max(scores)
+        scores = list(map(lambda x: (x - s_min) / (s_max - s_min), scores))
+
         msg_scores = {
             "messages": filter_by_author("message", name, train_data.messages),
-            "scores": filter_by_author("score", name, train_data.messages)
+            "scores": scores
         }
 
         # Обучаем модель
@@ -112,23 +127,64 @@ def make_predict():
     return lambda_predict
 
 
-def test_predict():
-    model_analytic = make_predict()(train_history, prompts_analytic["name"])
-    model_finance = make_predict()(train_history, prompt_finance["name"])
+def compute_subspace_intersection(texts_A, texts_B, n_components=100):
+    # 1. единый TF-IDF словарь
+    tfidf = TfidfVectorizer(max_features=5000)
+    tfidf.fit(texts_A + texts_B)
 
-    predict_analytic = model_analytic(test_history)
-    predict_finance = model_finance(test_history)
+    X_A = tfidf.transform(texts_A)
+    X_B = tfidf.transform(texts_B)
 
-    print(f"""
-        Analytics:
-            Matrix: {predict_analytic["matrix"]}
-            Predict: {predict_analytic["predict"]}
-        Finance:
-            Matrix: {predict_finance["matrix"]}
-            Predict: {predict_finance["predict"]}
-    """)
+    # 2. отдельные SVD
+    svd_A = TruncatedSVD(n_components=n_components, random_state=0)
+    svd_B = TruncatedSVD(n_components=n_components, random_state=0)
 
-    print(1)
+    U_A = normalize(svd_A.fit_transform(X_A))
+    U_B = normalize(svd_B.fit_transform(X_B))
+
+    # 3. канонические углы
+    C = U_A.T @ U_B
+    P, sigma, Q = np.linalg.svd(C)
+
+    angles = np.arccos(np.clip(sigma, -1, 1))
+
+    dim_intersection = np.sum(sigma > 1 - 1e-6)
+    overlap_energy = np.sum(sigma ** 2)
+    normalized_energy = overlap_energy / len(sigma)
+
+    return dict(
+        sigma=sigma,
+        angles_rad=angles,
+        dim_intersection=dim_intersection,
+        overlap_energy=overlap_energy,
+        normalized_energy=normalized_energy
+    )
+
+
+def compute_subspace_intersection_v2(text1, text2, tf_idf):
+    svd_1 = TruncatedSVD(n_components=N_COMPONENTS, random_state=0)
+    svd_2 = TruncatedSVD(n_components=N_COMPONENTS, random_state=0)
+
+    svd_1.fit(tf_idf.transform(text1))
+    svd_2.fit(tf_idf.transform(text2))
+
+    V_1 = svd_1.components_.T
+    V_2 = svd_2.components_.T
+
+    C = V_1.T @ V_2
+    P, sigma, Q = np.linalg.svd(C)
+    angles = np.arccos(np.clip(sigma, -1, 1))
+    dim_intersection = np.sum(sigma > 1 - 1e-6)
+    overlap_energy = np.sum(sigma ** 2)
+    normalized_energy = overlap_energy / len(sigma)
+
+    return {
+        "sigma": sigma,
+        "angles_rad": angles,
+        "dim_intersection": dim_intersection,
+        "overlap_energy": overlap_energy,
+        "normalized_energy": normalized_energy,
+    }
 
 
 if __name__ == "__main__":
@@ -138,6 +194,13 @@ if __name__ == "__main__":
         scope=os.getenv("GIGACHAT_SCOPE"),
         verify_ssl_certs=False
     )
+
+    embeddings = GigaChatEmbeddings(
+        credentials=os.getenv("GIGACHAT_API_TOKEN"),
+        scope=os.getenv("GIGACHAT_SCOPE"),
+        verify_ssl_certs=False
+    )
+
     analytic = Agent(
         name=prompts_analytic["name"],
         prompt=prompts_analytic["system"],
@@ -149,12 +212,30 @@ if __name__ == "__main__":
         model=model
     )
 
-    train_history, test_history = make_history()
-    model_analytic = make_predict()(train_history, prompts_analytic["name"])
-    model_finance = make_predict()(train_history, prompt_finance["name"])
+    train_history, test_history = make_history(lambda prompt, response: embedding_metrics(prompt, response, embeddings))
+
+    predict_model = make_predict(train_history, [prompts_analytic["system"], prompt_finance["system"]])
+    model_analytic = predict_model(prompts_analytic["name"])
+    model_finance = predict_model(prompt_finance["name"])
 
     predict_analytic = model_analytic(test_history)
     predict_finance = model_finance(test_history)
+
+    volumes_train_text = compute_subspace_intersection_v2(
+        filter_by_author("message", prompts_analytic["name"], train_history.messages),
+        filter_by_author("message", prompt_finance["name"], train_history.messages),
+        predict_analytic["tf_idf"]
+    )
+    volumes_test_text = compute_subspace_intersection_v2(
+        filter_by_author("message", prompts_analytic["name"], test_history.messages),
+        filter_by_author("message", prompt_finance["name"], test_history.messages),
+        predict_analytic["tf_idf"]
+    )
+    volumes_prompts = compute_subspace_intersection_v2(
+        [prompts_analytic["system"]],
+        [prompt_finance["system"]],
+        predict_analytic["tf_idf"]
+    )
 
     common_result = {
         prompts_analytic["name"]: {
@@ -166,9 +247,17 @@ if __name__ == "__main__":
             "predict": predict_finance["predict"],
         }
     }
+    common_volumes_result = {
+        "train_text": volumes_train_text,
+        "test_text": volumes_test_text,
+        "prompts": volumes_prompts,
+    }
 
-    json_ = json.dumps(common_result, indent=2, cls=NumpyArrayEncoder)
-    save_to_file(lambda file: file.write(json_), f"result.json")
+    json_predict_result = json.dumps(common_result, indent=2, cls=NumpyArrayEncoder)
+    json_volumes_result = json.dumps(common_volumes_result, indent=2, cls=NumpyArrayEncoder)
+
+    save_to_file(lambda file: file.write(json_predict_result), f"predict.json")
+    save_to_file(lambda file: file.write(json_volumes_result), f"volumes.json")
 
     print(f"""
         Analytics:

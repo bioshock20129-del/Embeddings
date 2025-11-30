@@ -1,7 +1,10 @@
 from collections.abc import Callable
 from json import JSONEncoder
 
-import numpy
+import numpy as np
+from langchain_gigachat import GigaChatEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 def save_to_file(fn: Callable, filename):
@@ -19,11 +22,29 @@ def make_pipeline(*steps):
     return wrapper
 
 
+def embedding_metrics(prompt, message, embedding: GigaChatEmbeddings):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=14
+    )
+
+    emb_prompt = np.array(embedding.embed_documents(splitter.split_text(prompt)))
+    emb_message = np.array(embedding.embed_documents(splitter.split_text(message)))
+
+    cos_sim = cosine_similarity(emb_prompt, emb_message).mean(axis=0)[0]
+
+    return cos_sim
+
+
 class NumpyArrayEncoder(JSONEncoder):
     def default(self, obj):
-        if isinstance(obj, numpy.ndarray):
+        if isinstance(obj, (np.integer, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
             return obj.tolist()
-        return JSONEncoder.default(self, obj)
+        return super().default(obj)
 
 
 def filter_by_author(field: str, author: str, texts: list[dict[str, str]]):

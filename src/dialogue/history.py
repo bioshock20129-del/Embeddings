@@ -1,7 +1,8 @@
 import json
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_gigachat import GigaChatEmbeddings
 from pydantic import BaseModel
 
 from src.llm.agent import Agent
@@ -20,8 +21,8 @@ class HistoryDialogue(BaseModel):
     def last_message(self):
         return self.messages[-1]
 
-    def push(self, author: str, message: str):
-        self.messages.append({"author": author, "message": message})
+    def push(self, author: str, message: str, score: float = 0):
+        self.messages.append({"author": author, "message": message, "score": score})
         return self
 
     def to_json(self) -> str:
@@ -44,7 +45,8 @@ def generate_from_llm(
         agent_1: Agent,
         agent_2: Agent,
         start_message: str,
-        size_dialogue: int
+        size_dialogue: int,
+        score_fn: Callable[[str, str], float],
 ) -> HistoryDialogue:
     history = HistoryDialogue(capacity=size_dialogue).push("Dev", start_message)
 
@@ -57,7 +59,8 @@ def generate_from_llm(
                 messages.append(AIMessage(content["message"]))
 
         response = agent.send_human_message(msg, messages)
-        history.push(agent.name, response.content)
+        score = score_fn(agent.prompt, response.content)
+        history.push(agent.name, response.content, score)
 
     is_agent_1 = True
     while not history.is_full:
