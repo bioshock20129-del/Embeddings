@@ -2,7 +2,6 @@ import json
 from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_gigachat import GigaChatEmbeddings
 from pydantic import BaseModel
 
 from src.llm.agent import Agent
@@ -48,7 +47,7 @@ def generate_from_llm(
         size_dialogue: int,
         score_fn: Callable[[str, str], float],
 ) -> HistoryDialogue:
-    history = HistoryDialogue(capacity=size_dialogue).push("Dev", start_message)
+    history = HistoryDialogue(capacity=size_dialogue + 1).push("Dev", start_message)
 
     def call_agent(agent, msg):
         messages = []

@@ -7,12 +7,12 @@ from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import normalize
 
 from src.dialogue.history import generate_from_llm, read_from_file, HistoryDialogue
+from src.embeddings.prompt_regressor import PromptAngleRegressor
 from src.llm.agent import Agent
 from src.llm.prompts import prompts_analytic, prompt_finance
-from src.utils import save_to_file, make_pipeline, NumpyArrayEncoder, filter_by_author, embedding_metrics
+from src.utils import save_to_file, NumpyArrayEncoder, filter_by_author, embedding_metrics, make_pipeline
 
 # загружаем переменные окружения из .env
 load_dotenv(find_dotenv())
@@ -23,6 +23,9 @@ PATH_TO_DATA = os.path.join(os.getcwd(), "data")
 SIZE_FOR_GENERATE = 101
 TEST_HISTORY_FROM_FILE = True
 TRAIN_HISTORY_FROM_FILE = True
+
+TRAIN_FILE = "train_history_100.json"
+TEST_FILE = "test_history_100.json"
 
 # Settings for TF-IDT
 NGRAM_RANGE = (1, 2)
@@ -39,14 +42,14 @@ def make_history(score_fn):
     start_message = """Если смотреть на кризис 2008 года системно, то ключевым триггером стала переоценка рисков на рынке ипотечных деривативов. 
     Банки массово упаковывали плохие кредиты в сложные финансовые инструменты, теряя понимание их реальной стоимости…"""
 
-    path_to_train = os.path.join(PATH_TO_DATA, "train_history_100.json")
+    path_to_train = os.path.join(PATH_TO_DATA, TRAIN_FILE)
     if not TRAIN_HISTORY_FROM_FILE:
         train_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE, score_fn)
         train_history.save_to_file(path_to_train)
     else:
         train_history = read_from_file(path_to_train)
 
-    path_to_test = os.path.join(PATH_TO_DATA, "test_history_100.json")
+    path_to_test = os.path.join(PATH_TO_DATA, TEST_FILE)
     if not TEST_HISTORY_FROM_FILE:
         test_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE, score_fn)
         test_history.save_to_file(path_to_test)
@@ -56,21 +59,20 @@ def make_history(score_fn):
     return train_history, test_history
 
 
-def make_predict(train_data: HistoryDialogue, prompts):
-    global_tf_idf = TfidfVectorizer(lowercase=LOWERCASE,
-                                    stop_words=STOP_WORDS,
-                                    ngram_range=NGRAM_RANGE,
-                                    max_features=MAX_FEATURES)
-    global_tf_idf.fit(
-        list(map(lambda x: x["message"], train_data.messages)) + prompts
-    )
-
+def make_predict(train_data: HistoryDialogue, prompts: dict):
     pipeline_by_get_model = make_pipeline(
         lambda data_author: {
-            "tf_idf": global_tf_idf,
+            "tf_idf": TfidfVectorizer(lowercase=LOWERCASE,
+                                      stop_words=STOP_WORDS,
+                                      ngram_range=NGRAM_RANGE,
+                                      max_features=MAX_FEATURES),
             "svd": TruncatedSVD(n_components=N_COMPONENTS, random_state=RANDOM_STATE),
-            "data": data_author["messages"],
+            "data": data_author["messages"] + data_author["prompt"],
             "scores": data_author["scores"]
+        },
+        lambda state: {
+            **state,
+            "tf_idf": state["tf_idf"].fit(state["data"]),
         },
         lambda state: {
             **state,
@@ -105,6 +107,7 @@ def make_predict(train_data: HistoryDialogue, prompts):
 
         msg_scores = {
             "messages": filter_by_author("message", name, train_data.messages),
+            "prompt": prompts[name],
             "scores": scores
         }
 
@@ -125,40 +128,6 @@ def make_predict(train_data: HistoryDialogue, prompts):
         return predict
 
     return lambda_predict
-
-
-def compute_subspace_intersection(texts_A, texts_B, n_components=100):
-    # 1. единый TF-IDF словарь
-    tfidf = TfidfVectorizer(max_features=5000)
-    tfidf.fit(texts_A + texts_B)
-
-    X_A = tfidf.transform(texts_A)
-    X_B = tfidf.transform(texts_B)
-
-    # 2. отдельные SVD
-    svd_A = TruncatedSVD(n_components=n_components, random_state=0)
-    svd_B = TruncatedSVD(n_components=n_components, random_state=0)
-
-    U_A = normalize(svd_A.fit_transform(X_A))
-    U_B = normalize(svd_B.fit_transform(X_B))
-
-    # 3. канонические углы
-    C = U_A.T @ U_B
-    P, sigma, Q = np.linalg.svd(C)
-
-    angles = np.arccos(np.clip(sigma, -1, 1))
-
-    dim_intersection = np.sum(sigma > 1 - 1e-6)
-    overlap_energy = np.sum(sigma ** 2)
-    normalized_energy = overlap_energy / len(sigma)
-
-    return dict(
-        sigma=sigma,
-        angles_rad=angles,
-        dim_intersection=dim_intersection,
-        overlap_energy=overlap_energy,
-        normalized_energy=normalized_energy
-    )
 
 
 def compute_subspace_intersection_v2(text1, text2, tf_idf):
@@ -214,7 +183,31 @@ if __name__ == "__main__":
 
     train_history, test_history = make_history(lambda prompt, response: embedding_metrics(prompt, response, embeddings))
 
-    predict_model = make_predict(train_history, [prompts_analytic["system"], prompt_finance["system"]])
+    predictor_analytic = PromptAngleRegressor(
+        prompt=prompts_analytic["system"],
+        tf_idf=TfidfVectorizer(lowercase=LOWERCASE, stop_words=STOP_WORDS, ngram_range=NGRAM_RANGE,
+                               max_features=MAX_FEATURES),
+        svd=TruncatedSVD(n_components=N_COMPONENTS, random_state=RANDOM_STATE),
+    )
+
+    messages_analytic = filter_by_author("message", prompts_analytic["name"], train_history.messages)
+    scores_analytic = filter_by_author("score", prompts_analytic["name"], train_history.messages)
+    s_min, s_max = np.min(scores_analytic), np.max(scores_analytic)
+    scores_analytic = list(map(lambda x: (x - s_min) / (s_max - s_min), scores_analytic))
+
+    predictor_analytic.fit(
+        answers=messages_analytic,
+        scores=scores_analytic
+    )
+
+    answers = filter_by_author("message", prompts_analytic["name"], test_history.messages)
+    print(predictor_analytic.predict(answers))
+
+    predict_model = make_predict(train_history, {
+        prompts_analytic["name"]: prompts_analytic["system"],
+        prompt_finance["name"]: prompt_finance["system"]
+    })
+
     model_analytic = predict_model(prompts_analytic["name"])
     model_finance = predict_model(prompt_finance["name"])
 

@@ -13,7 +13,7 @@ sns.set_palette("husl")
 def load_and_analyze_data():
     """Загрузка и базовый анализ данных"""
     try:
-        with open('../../predict.json', 'r') as f:
+        with open('../../predict_old.json', 'r') as f:
             data = json.load(f)
 
         analytic_scores = data['Analytic']['predict']
