@@ -1,31 +1,30 @@
 import json
 import os
 
-import numpy as np
 from dotenv import load_dotenv, find_dotenv
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
-from sklearn.decomposition import TruncatedSVD
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LinearRegression
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 
-from src.dialogue.history import generate_from_llm, read_from_file, HistoryDialogue
-from src.embeddings.prompt_regressor import PromptAngleRegressor
+from src.dialogue.history import generate_from_llm, read_from_file
 from src.llm.agent import Agent
-from src.llm.prompts import prompts_analytic, prompt_finance
-from src.utils import save_to_file, NumpyArrayEncoder, filter_by_author, embedding_metrics, make_pipeline
+from src.llm.prompts import ValidatorPrompt, AnalyticsPrompt, \
+    FinancePrompt, BadGuyPrompt
+from src.predict_models.embedding_regressor import EmbeddingRegressor
+from src.predict_models.prompt_regressor_v2 import PromptAngleRegressorAdvanced
+from src.utils import embedding_metrics, save_to_file, NumpyArrayEncoder
 
 # загружаем переменные окружения из .env
 load_dotenv(find_dotenv())
 
-PATH_TO_DATA = os.path.join(os.getcwd(), "data")
+PATH_TO_DATA = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
 # Settings for history of llm chat
-SIZE_FOR_GENERATE = 101
-TEST_HISTORY_FROM_FILE = True
+SIZE_FOR_GENERATE = 100
+TEST_HISTORY_FROM_FILE = False
 TRAIN_HISTORY_FROM_FILE = True
 
 TRAIN_FILE = "train_history_100.json"
-TEST_FILE = "test_history_100.json"
+TEST_FILE = "test_history_100_with_bad_guy(2).json"
 
 # Settings for TF-IDT
 NGRAM_RANGE = (1, 2)
@@ -38,20 +37,20 @@ N_COMPONENTS = 100
 RANDOM_STATE = 42
 
 
-def make_history(score_fn):
+def make_history(score_fn, bad_guy: Agent):
     start_message = """Если смотреть на кризис 2008 года системно, то ключевым триггером стала переоценка рисков на рынке ипотечных деривативов. 
     Банки массово упаковывали плохие кредиты в сложные финансовые инструменты, теряя понимание их реальной стоимости…"""
 
     path_to_train = os.path.join(PATH_TO_DATA, TRAIN_FILE)
     if not TRAIN_HISTORY_FROM_FILE:
-        train_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE, score_fn)
+        train_history = generate_from_llm(analytic, finance, bad_guy, start_message, SIZE_FOR_GENERATE, score_fn)
         train_history.save_to_file(path_to_train)
     else:
         train_history = read_from_file(path_to_train)
 
     path_to_test = os.path.join(PATH_TO_DATA, TEST_FILE)
     if not TEST_HISTORY_FROM_FILE:
-        test_history = generate_from_llm(analytic, finance, start_message, SIZE_FOR_GENERATE, score_fn)
+        test_history = generate_from_llm(analytic, finance, bad_guy, start_message, SIZE_FOR_GENERATE, score_fn)
         test_history.save_to_file(path_to_test)
     else:
         test_history = read_from_file(path_to_test)
@@ -59,101 +58,29 @@ def make_history(score_fn):
     return train_history, test_history
 
 
-def make_predict(train_data: HistoryDialogue, prompts: dict):
-    pipeline_by_get_model = make_pipeline(
-        lambda data_author: {
-            "tf_idf": TfidfVectorizer(lowercase=LOWERCASE,
-                                      stop_words=STOP_WORDS,
-                                      ngram_range=NGRAM_RANGE,
-                                      max_features=MAX_FEATURES),
-            "svd": TruncatedSVD(n_components=N_COMPONENTS, random_state=RANDOM_STATE),
-            "data": data_author["messages"] + data_author["prompt"],
-            "scores": data_author["scores"]
-        },
-        lambda state: {
-            **state,
-            "tf_idf": state["tf_idf"].fit(state["data"]),
-        },
-        lambda state: {
-            **state,
-            "matrix": state["svd"].fit_transform(state["tf_idf"].transform(state["data"]))
-        },
-        lambda state: {
-            **state,
-            "model": LinearRegression().fit(state["matrix"], state["scores"])
-        }
-    )
-
-    pipeline_by_predict = make_pipeline(
-        lambda state: {
-            **state,
-            "messages": filter_by_author("message", state["name_author"], state["data"]),
-        },
-        lambda state: {
-            **state,
-            "matrix": state["svd"].transform(state["tf_idf"].transform(state["messages"]))
-        },
-        lambda state: {
-            **state,
-            "predict": state["model"].predict(state["matrix"])
-        }
-    )
-
-    def lambda_predict(name):
-        # Получаем сообщения и оценки
-        scores = filter_by_author("score", name, train_data.messages)
-        s_min, s_max = np.min(scores), np.max(scores)
-        scores = list(map(lambda x: (x - s_min) / (s_max - s_min), scores))
-
-        msg_scores = {
-            "messages": filter_by_author("message", name, train_data.messages),
-            "prompt": prompts[name],
-            "scores": scores
-        }
-
-        # Обучаем модель
-        model_state = pipeline_by_get_model(msg_scores)
-
-        def predict(test_data):
-            # Делаем предсказание
-            prediction_data = {
-                "data": test_data.messages,
-                "name_author": name,
-                "tf_idf": model_state["tf_idf"],
-                "svd": model_state["svd"],
-                "model": model_state["model"]
-            }
-            return pipeline_by_predict(prediction_data)
-
-        return predict
-
-    return lambda_predict
-
-
-def compute_subspace_intersection_v2(text1, text2, tf_idf):
-    svd_1 = TruncatedSVD(n_components=N_COMPONENTS, random_state=0)
-    svd_2 = TruncatedSVD(n_components=N_COMPONENTS, random_state=0)
-
-    svd_1.fit(tf_idf.transform(text1))
-    svd_2.fit(tf_idf.transform(text2))
-
-    V_1 = svd_1.components_.T
-    V_2 = svd_2.components_.T
-
-    C = V_1.T @ V_2
-    P, sigma, Q = np.linalg.svd(C)
-    angles = np.arccos(np.clip(sigma, -1, 1))
-    dim_intersection = np.sum(sigma > 1 - 1e-6)
-    overlap_energy = np.sum(sigma ** 2)
-    normalized_energy = overlap_energy / len(sigma)
-
-    return {
-        "sigma": sigma,
-        "angles_rad": angles,
-        "dim_intersection": dim_intersection,
-        "overlap_energy": overlap_energy,
-        "normalized_energy": normalized_energy,
-    }
+def get_predict_models_for_agent(
+        prompt: str,
+        model: Agent,
+        embeddings,
+        train_history,
+        train_score
+) -> list:
+    return [
+        PromptAngleRegressorAdvanced.get_and_fit(
+            prompt=prompt,
+            answers=train_history,
+            scores=train_score,
+            answer_subspace_dim=10
+        ),
+        # LLMRegressor.get_and_fit(
+        #     model=model,
+        #     prompt=prompt,
+        # ),
+        EmbeddingRegressor.get_and_fit(
+            embedding=lambda docs: embeddings.embed_documents(docs),
+            prompt=prompt,
+        )
+    ]
 
 
 if __name__ == "__main__":
@@ -161,8 +88,11 @@ if __name__ == "__main__":
         credentials=os.getenv("GIGACHAT_API_TOKEN"),
         model=os.getenv("GIGACHAT_MODEL"),
         scope=os.getenv("GIGACHAT_SCOPE"),
-        verify_ssl_certs=False
+        verify_ssl_certs=False,
     )
+
+    model_ollama = ChatOllama(model="deepseek-r1:1.5b")
+    embedding_ollama = OllamaEmbeddings(model="nomic-embed-text:latest")
 
     embeddings = GigaChatEmbeddings(
         credentials=os.getenv("GIGACHAT_API_TOKEN"),
@@ -170,93 +100,48 @@ if __name__ == "__main__":
         verify_ssl_certs=False
     )
 
+    validator = Agent(
+        name=ValidatorPrompt.name,
+        prompt=ValidatorPrompt.system,
+        model=model,
+    )
     analytic = Agent(
-        name=prompts_analytic["name"],
-        prompt=prompts_analytic["system"],
+        name=AnalyticsPrompt.name,
+        prompt=AnalyticsPrompt.system,
         model=model
     )
     finance = Agent(
-        name=prompt_finance["name"],
-        prompt=prompt_finance["system"],
+        name=FinancePrompt.name,
+        prompt=FinancePrompt.system,
+        model=model
+    )
+    bad_guy = Agent(
+        name=BadGuyPrompt.name,
+        prompt=BadGuyPrompt.system,
         model=model
     )
 
-    train_history, test_history = make_history(lambda prompt, response: embedding_metrics(prompt, response, embeddings))
+    actors = [
+        AnalyticsPrompt,
+        FinancePrompt,
+    ]
 
-    predictor_analytic = PromptAngleRegressor(
-        prompt=prompts_analytic["system"],
-        tf_idf=TfidfVectorizer(lowercase=LOWERCASE, stop_words=STOP_WORDS, ngram_range=NGRAM_RANGE,
-                               max_features=MAX_FEATURES),
-        svd=TruncatedSVD(n_components=N_COMPONENTS, random_state=RANDOM_STATE),
+    result = {}
+    train_history, test_history = make_history(
+        lambda prompt, response: embedding_metrics(prompt, response, embeddings),
+        bad_guy
     )
+    for actor in actors:
+        predict_models = get_predict_models_for_agent(
+            actor.system,
+            validator,
+            embedding_ollama,
+            train_history.messages_by_author(actor.name),
+            train_history.scores_by_author(actor.name)
+        )
 
-    messages_analytic = filter_by_author("message", prompts_analytic["name"], train_history.messages)
-    scores_analytic = filter_by_author("score", prompts_analytic["name"], train_history.messages)
-    s_min, s_max = np.min(scores_analytic), np.max(scores_analytic)
-    scores_analytic = list(map(lambda x: (x - s_min) / (s_max - s_min), scores_analytic))
+        actor_answers = test_history.messages_by_author(actor.name)
+        result[actor.name] = {model.name: {"Predict scores": list(zip(model.predict(actor_answers), actor_answers))} for model in predict_models}
 
-    predictor_analytic.fit(
-        answers=messages_analytic,
-        scores=scores_analytic
-    )
-
-    answers = filter_by_author("message", prompts_analytic["name"], test_history.messages)
-    print(predictor_analytic.predict(answers))
-
-    predict_model = make_predict(train_history, {
-        prompts_analytic["name"]: prompts_analytic["system"],
-        prompt_finance["name"]: prompt_finance["system"]
-    })
-
-    model_analytic = predict_model(prompts_analytic["name"])
-    model_finance = predict_model(prompt_finance["name"])
-
-    predict_analytic = model_analytic(test_history)
-    predict_finance = model_finance(test_history)
-
-    volumes_train_text = compute_subspace_intersection_v2(
-        filter_by_author("message", prompts_analytic["name"], train_history.messages),
-        filter_by_author("message", prompt_finance["name"], train_history.messages),
-        predict_analytic["tf_idf"]
-    )
-    volumes_test_text = compute_subspace_intersection_v2(
-        filter_by_author("message", prompts_analytic["name"], test_history.messages),
-        filter_by_author("message", prompt_finance["name"], test_history.messages),
-        predict_analytic["tf_idf"]
-    )
-    volumes_prompts = compute_subspace_intersection_v2(
-        [prompts_analytic["system"]],
-        [prompt_finance["system"]],
-        predict_analytic["tf_idf"]
-    )
-
-    common_result = {
-        prompts_analytic["name"]: {
-            "matrix": predict_analytic["matrix"],
-            "predict": predict_analytic["predict"],
-        },
-        prompt_finance["name"]: {
-            "matrix": predict_finance["matrix"],
-            "predict": predict_finance["predict"],
-        }
-    }
-    common_volumes_result = {
-        "train_text": volumes_train_text,
-        "test_text": volumes_test_text,
-        "prompts": volumes_prompts,
-    }
-
-    json_predict_result = json.dumps(common_result, indent=2, cls=NumpyArrayEncoder)
-    json_volumes_result = json.dumps(common_volumes_result, indent=2, cls=NumpyArrayEncoder)
-
-    save_to_file(lambda file: file.write(json_predict_result), f"predict.json")
-    save_to_file(lambda file: file.write(json_volumes_result), f"volumes.json")
-
-    print(f"""
-        Analytics:
-            Matrix: {predict_analytic["matrix"]}
-            Predict: {predict_analytic["predict"]}
-        Finance:
-            Matrix: {predict_finance["matrix"]}
-            Predict: {predict_finance["predict"]}
-    """)
+    json_result = json.dumps(result, indent=2, cls=NumpyArrayEncoder, ensure_ascii=False)
+    save_to_file(lambda file: file.write(json_result), f"../results.json")

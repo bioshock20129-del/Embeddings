@@ -2,7 +2,9 @@ from collections.abc import Callable
 from json import JSONEncoder
 
 import numpy as np
+from langchain_core.embeddings import Embeddings
 from langchain_gigachat import GigaChatEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -22,7 +24,7 @@ def make_pipeline(*steps):
     return wrapper
 
 
-def embedding_metrics(prompt, message, embedding: GigaChatEmbeddings):
+def embedding_metrics(prompt, message, embedding: Embeddings):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=14

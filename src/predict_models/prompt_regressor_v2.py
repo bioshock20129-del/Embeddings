@@ -11,7 +11,7 @@ from sklearn.linear_model import Ridge
 from sklearn.preprocessing import normalize
 from sklearn.utils.validation import check_is_fitted
 
-from src.embeddings.garbage_detector import GarbageDetector
+from src.predict_models.garbage_detector import GarbageDetector
 
 
 # -------------------------
@@ -147,6 +147,8 @@ class PromptAngleRegressorAdvanced(BaseEstimator, RegressorMixin, TransformerMix
     - model_alpha: Ridge regularization strength
     - random_state: for reproducibility in small-noise subspace generation
     """
+    name: str = "PromptAngleRegressor"
+
     tfidf_: TfidfVectorizer = None
     svd_: TruncatedSVD = None
     model_: Ridge = None
@@ -299,12 +301,14 @@ class PromptAngleRegressorAdvanced(BaseEstimator, RegressorMixin, TransformerMix
         check_is_fitted(self, ["model_"])
 
         predictions = []
-        for text in answers:
-            if self.garbage_detector.is_garbage(text):
+        for i in range(len(answers)):
+            print(f"{self.name}: Proccessing answer {i} of {len(answers)}")
+            answer = answers[i]
+            if self.garbage_detector.is_garbage(answer):
                 predictions.append(self.garbage_penalty)
                 continue
 
-            X = self.transform([text])
+            X = self.transform([answer])
             predict = self.model_.predict(X)
             predictions.append(predict[0])
 
@@ -356,3 +360,28 @@ class PromptAngleRegressorAdvanced(BaseEstimator, RegressorMixin, TransformerMix
         emb_names = [f"svd_{i}" for i in range(self.n_components)]
         angle_names = list(self.angle_feature_names_)
         return emb_names + angle_names
+
+    @staticmethod
+    def get_and_fit(
+            prompt: str,
+            answers: List[str],
+            scores: List[float],
+            n_components: int = 100,
+            answer_subspace_dim: int = 1,
+            model_alpha: float = 1.0,
+            stop_words: Optional[str] = "russian",
+            random_state: int = 42,
+            garbage_penalty: float = 0.0,
+    ):
+        model = PromptAngleRegressorAdvanced(
+            prompt=prompt,
+            n_components=n_components,
+            answer_subspace_dim=answer_subspace_dim,
+            model_alpha=model_alpha,
+            stop_words=stop_words,
+            random_state=random_state,
+            garbage_penalty=garbage_penalty,
+        )
+        model.fit(answers, scores)
+
+        return model
